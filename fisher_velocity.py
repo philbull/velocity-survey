@@ -19,93 +19,125 @@ NMU = 300
 SAREA = 5000. # deg^2
 
 
-def bias(z):
+def bias(z, params):
     """
     Galaxy bias as a function of redshift, b(z).
     """
     # FIXME
-    return np.sqrt(1. + z)
+    return params['b0'] * np.sqrt(1. + z)
 
-def corrfac(z):
+def corrfac(z, params):
     """
     Correlation coefficient between galaxy distribution and velocity field, r(z).
     """
-    r_g = 0.98
+    r_g = params['r_g'] #0.98
     return r_g + 0.*z # FIXME
 
-def sigma_g(z):
+def sigma_g(z, params):
     """
     Non-linear velocity rms, used as the smoothing scale in the Fingers of God 
     expression for galaxies.
     """
-    sigma_g = 5.8 / 0.67 # 5.1 Mpc/h
+    sigma_g = params['sigma_g'] # Mpc
     return sigma_g + 0.*z # FIXME
 
-def sigma_u(z):
+def sigma_u(z, params):
     """
     Non-linear velocity rms, used as the smoothing scale for the redshift-space 
     velocity field.
     """
-    sigma_u = 13. / 0.67 # 13 Mpc/h
+    sigma_u = params['sigma_u'] # Mpc
     return sigma_u + 0.*z # FIXME
 
-def sigma_velocity(zc):
+def sigma_velocity(zc, params):
     """
     Noise rms on the peculiar velocity measurement (units: (km/s)^2 Mpc^-3)
     """
-    sigma_disp = 300. # non-linear velocity dispersion [km/s]
-    sigma_vobs = 0.2 * C * zc # Corrected version of Eq. 14 of arXiv:1312.1022
+    sigma_disp = params['sigma_disp'] # non-linear velocity dispersion [km/s]
+    
+    # Corrected version of Eq. 14 of arXiv:1312.1022
+    sigma_vobs = params['vel_err'] * C * zc
+    
     return np.sqrt(sigma_disp**2. + sigma_vobs**2.) # km/s
     
-def n_gal(zc):
+def n_gal(zc, params):
     """
     Number density of detected HI galaxies in a given redshift bin, n ~ Mpc^-3.
     """
-    return 2e-3 # Mpc^-3 (FIXME: use real numbers)
+    return 1e-4 #2e-3 # Mpc^-3 (FIXME: use real numbers)
 
-def n_vel(zc):
+def n_vel(zc, params):
     """
     Number density of detected HI galaxies with peculiar velocity measurements, 
     n_vel ~ Mpc^-3.
     """
-    return 1e-2 * n_gal(zc) # Mpc^-3 (FIXME: use real numbers)
+    return 1e-1 #1e-2 #1e-2 * n_gal(zc, params) # Mpc^-3 (FIXME: use real numbers)
     
 
 def build_ccl_cosmo(params):
     """
     Build CCL Cosmology object for a given set of parameters.
     """
-    # Define a default set of parameters
-    default_params = {
-        'Omega_c':  0.2647,
-        'Omega_b':  0.0492,
-        'h':        0.673,
-        'A_s':      2.207e-9,
-        'n_s':      0.9645,
-        'w0':      -1.,
-        'wa':      0.,
-    }
-    p = copy.copy(default_params)
+    # List of parameters that should be passed to CCL if they are provided
+    cosmo_params = ['Omega_c', 'Omega_b', 'h', 'n_s', 'w0', 'wa', 'sigma8', 'A_s']
     
-    # Replace parameters that were defined
+    # Set parameters that were defined
+    pcosmo = {}; param_set = {}
     for pn in params.keys():
         
         # Add parameter to dictionary if allowed
         if pn == '10^9A_s':
             # Treat A_s separately; rescale by 1e9
-            p['A_s'] = params[pn] / 1e9
+            pcosmo['A_s'] = params[pn] / 1e9
             
-        elif pn in default_params.keys():
-            p[pn] = params[pn]
+        elif pn in cosmo_params:
+            # Regular cosmological parameters
+            pcosmo[pn] = params[pn]
             
         else:
-            # Ignores non-cosmological parameters
-            pass
+            # Add non-cosmological parameters to a different dict
+            param_set[pn] = params[pn]
     
     # Create CCL Cosmology() object and return
-    return ccl.Cosmology(**p)
+    cosmo = ccl.Cosmology(**pcosmo)
+    return cosmo, param_set
 
-def signal_covariance(zc, cosmo):
+def signal_power(zc, k, mu, cosmo, params):
+    """
+    Return the signal auto- and cross-power spectra.
+    """
+    # Scale factor at central redshift
+    a = 1. / (1. + zc)
+    
+    # Get matter power spectrum
+    pk = ccl.linear_matter_power(cosmo, k, a)
+    
+    # Get redshift-dep. functions
+    b = bias(zc, params)
+    rg = corrfac(zc, params)
+    f = params['x_f'] * ccl.growth_rate(cosmo, a)
+    beta = f / b
+    H = params['x_H'] * ccl.h_over_h0(cosmo, a) * 100. * cosmo['h'] # km/s/Mpc
+    
+    # Redshift-space suppression factors
+    D_g = 1. / np.sqrt(1. + 0.5*(k*mu*sigma_g(zc, params))**2.)
+    D_u = np.sinc(k*sigma_u(zc, params))
+    
+    # galaxy-galaxy (dimensionless)
+    pk_gg = b**2. * (1. + 2.*rg*beta*mu**2. + beta**2.*mu**4.) * D_g**2. * pk
+    
+    # galaxy-velocity (units: km/s)
+    pk_gv = 1.j * a*H*f*b*mu * (rg + beta*mu**2.) * D_g * D_u / k * pk
+    #pk_vg = -1. * pk_gv # Complex conjugate
+    
+    # velocity-velocity (units: [km/s]^2)
+    pk_vv = (a*H*f*mu)**2. * (D_u / k)**2. * pk
+    
+    # Multiply all elements by P(k) and return
+    return pk_gg, pk_gv, pk_vv
+
+
+def signal_covariance(zc, cosmo, params):
     """
     Signal power spectrum matrix, containing (cross-)spectra for gg, gv, vv. 
     These are simply the galaxy auto-, galaxy-velocity cross-, and velocity 
@@ -123,15 +155,15 @@ def signal_covariance(zc, cosmo):
     pk = ccl.linear_matter_power(cosmo, k, a=1.)
     
     # Get redshift-dep. functions
-    b = bias(zc)
-    rg = corrfac(zc)
-    f = ccl.growth_rate(cosmo, a)
+    b = bias(zc, params)
+    rg = corrfac(zc, params)
+    f = params['x_f'] * ccl.growth_rate(cosmo, a)
     beta = f / b
-    H = ccl.h_over_h0(cosmo, a) * 100. * cosmo['h'] # km/s/Mpc
+    H = params['x_H'] * ccl.h_over_h0(cosmo, a) * 100. * cosmo['h'] # km/s/Mpc
     
     # Redshift-space suppression factors
-    D_g = 1. / np.sqrt(1. + 0.5*(K*MU*sigma_g(zc))**2.)
-    D_u = np.sinc(K*sigma_u(zc))
+    D_g = 1. / np.sqrt(1. + 0.5*(K*MU*sigma_g(zc, params))**2.)
+    D_u = np.sinc(K*sigma_u(zc, params))
     
     # Build 2x2 matrix of mu- and k-dependent pre-factors of P(k)
     fac = np.zeros((2, 2, mu.size, k.size)).astype(complex)
@@ -150,14 +182,15 @@ def signal_covariance(zc, cosmo):
     return fac * pk[np.newaxis,np.newaxis,np.newaxis,:]
 
 
-def noise_covariance(zc):
+def noise_covariance(zc, params):
     """
     Noise covariance matrix for galaxy and velocity fields (assuming no 
     dependence on k or mu).
     """
     noise = np.zeros((2,2))
-    noise[0,0] = 1. / n_gal(zc) # Mpc^-3
-    noise[1,1] = sigma_velocity(zc)**2. / n_vel(zc) # (km/s)^2 Mpc^-3
+    noise[0,0] = 1. / n_gal(zc, params) # Mpc^-3
+    noise[1,1] = sigma_velocity(zc, params)**2. / n_vel(zc, params) 
+    # (km/s)^2 Mpc^-3
     return noise
 
 
@@ -165,8 +198,7 @@ def inverse_covariance(cs, cn):
     """
     Calculate inverse of signal + noise covariance.
     """
-    # cs shape: (2,2, NMU, MK)
-    # cn shape: (2,2)
+    # cs shape: (2,2, NMU, MK); cn shape: (2,2)
     ctot = cs + cn[:,:,np.newaxis,np.newaxis]
     
     # Calculate inverse using analytic inversion formula for 2x2 matrices
@@ -182,8 +214,9 @@ def signal_derivs(zc, params, dparams):
     Calculate derivatives of signal covariance w.r.t. cosmological parameters.
     """
     derivs = []
-    # Loop over parameters
-    pnames = params.keys()
+    
+    # Loop over parameters that should be included in Fisher matrix
+    pnames = dparams.keys()
     pnames.sort()
     for pname in pnames:
         print "  Derivative for %s" % pname
@@ -191,16 +224,17 @@ def signal_derivs(zc, params, dparams):
         
         # Setup new cosmologies with +/- dparam
         pp = copy.copy(params); pm = copy.copy(params)
-        pp[pname] += dp; pm[pname] -= dp
-        cosmo_p = build_ccl_cosmo(pp)
-        cosmo_m = build_ccl_cosmo(pm)
+        pp[pname] = params[pname] + dp
+        pm[pname] = params[pname] - dp
+        cosmo_p, params_p = build_ccl_cosmo(pp)
+        cosmo_m, params_m = build_ccl_cosmo(pm)
         
         # Calculate derivatives for each z bin
         deriv_z = []
         for _z in zc:
             print "    zc = %3.3f" % _z
-            cs_p = signal_covariance(_z, cosmo_p)
-            cs_m = signal_covariance(_z, cosmo_m)
+            cs_p = signal_covariance(_z, cosmo_p, params_p)
+            cs_m = signal_covariance(_z, cosmo_m, params_m)
             deriv_z.append((cs_p - cs_m) / (2.*dp))
         derivs.append(deriv_z)
     return pnames, np.array(derivs)
@@ -246,22 +280,22 @@ def integrate_fisher(zc, cs, cn, derivs):
     return Fij
             
 
-def fisher(zbins, params, dparams, expt):
+def fisher(zbins, params_in, dparams, expt):
     """
     Calculate Fisher matrices for a series of redshift bins.
     """
     # Define fiducial cosmology
-    cosmo0 = build_ccl_cosmo(params)
+    cosmo0, params0 = build_ccl_cosmo(params_in)
     
     # Redshift bin centroid
     zc = 0.5 * (zbins[1:] + zbins[:-1])
     
     # Get signal and noise covariance for each redshift bin
-    cs = [signal_covariance(_zc, cosmo0) for _zc in zc]
-    cn = [noise_covariance(_zc) for _zc in zc]
+    cs = [signal_covariance(_zc, cosmo0, params0) for _zc in zc]
+    cn = [noise_covariance(_zc, params0) for _zc in zc]
     
     # Calculate derivatives of signal covariance w.r.t. cosmological parameters
-    pnames, derivs = signal_derivs(zc, params, dparams)
+    pnames, derivs = signal_derivs(zc, params_in, dparams)
     
     # Calculate volume factor for each redshift bin
     fsky = expt['survey_area'] / (4.*np.pi*(180./np.pi)**2.) # SAREA in deg^2
@@ -270,12 +304,8 @@ def fisher(zbins, params, dparams, expt):
     print "Volumes (Gpc^3):", Veff/1e9
     
     # Calculate Fisher matrix for each redshift bin
-    Fz = []
-    for i in range(zc.size):
-        F = integrate_fisher(zc[i], cs[i], cn[i], derivs[:,i])
-        F *= Veff[i] / (8. * np.pi**2.) # volume, Fourier, and 1/2 factors
-        Fz.append(F)
-    
+    Fz = [ Veff[i] * integrate_fisher(zc[i], cs[i], cn[i], derivs[:,i]) 
+           for i in range(zc.size) ]
     return pnames, np.array(Fz)
     
 
@@ -283,6 +313,8 @@ if __name__ == '__main__':
     
     # Define fiducial parameters
     params = {
+        
+        # Cosmological parameters
         'Omega_c':  0.2647,
         'Omega_b':  0.0492,
         'h':        0.673,
@@ -290,15 +322,34 @@ if __name__ == '__main__':
         'n_s':      0.9645,
         'w0':       -1.,
         'wa':       0.,
+        
+        # Astrophysical/nuisance parameters
+        'b0':           1.,       # bias amplitude
+        'r_g':          0.98,     # gal-vel correlation coefficient
+        'sigma_g':      5.8/0.67, # Mpc, z-space smoothing scale (galaxies)
+        'sigma_u':      13./0.67, # Mpc, z-space smoothing scale (velocities)
+        'sigma_disp':   300.,     # km/s, non-linear velocity dispersion
+        'vel_err':      0.2,      # fractional error on velocities
+        
+        # Rescaling of cosmological functions (f -> x*f)
+        'x_f':          1.,       # Scaling of growth rate, f(z)
+        'x_H':          1.,       # Scaling of Hubble rate, H(z)
     }
     dparams = {
-        'Omega_c':  0.005,
-        'Omega_b':  0.001,
-        'h':        0.005,
-        '10^9A_s':  0.1,
-        'n_s':      2e-3,
-        'w0':       0.02,
-        'wa':       0.05,
+        #'Omega_c':     0.005,
+        #'Omega_b':     0.001,
+        #'h':           0.005,
+        '10^9A_s':      0.1,
+        #'n_s':         2e-3,
+        #'w0':          0.02,
+        #'wa':          0.05,
+        'x_f':          0.005,
+        'x_H':          0.005,
+        'b0':           0.005,
+        'r_g':          0.005,
+        'sigma_g':      0.05,
+        'sigma_u':      0.05,
+        'sigma_disp':   10.,
     }
     
     expt = {
@@ -315,12 +366,16 @@ if __name__ == '__main__':
     pnames, Fz = fisher(zbins, params, dparams, expt)
     
     # Save to file
-    fname = "Fz_test.dat"
-    #np.savetxt(fname, Fz, header=" ".join(pnames))
+    #fname = "Fz_test"
+    #fname = "Fz_test_lownoise"
+    fname = "Fz_test_novel"
     print pnames
-    print Fz
     np.save(fname, Fz)
-    print Fz.shape
+    
+    # Output parameter names
+    f = open("%s.params" % fname, 'w')
+    f.write(" ".join(pnames))
+    f.close()
     print("Output to %s" % fname)
     
     print "Run took %2.2f sec." % (time.time() - t0)
